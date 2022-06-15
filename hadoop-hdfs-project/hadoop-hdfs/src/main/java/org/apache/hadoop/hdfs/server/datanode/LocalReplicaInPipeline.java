@@ -52,8 +52,17 @@ public class LocalReplicaInPipeline extends LocalReplica
   private final Condition bytesOnDiskChange = lock.newCondition();
 
   private long bytesAcked;
+
+  // data 和 checksum 写操作系统后更新 (可能落盘)
+  // 读写 bytesOnDisk 和 lastChecksum 时会用 lock, 保证 bytesOnDisk 和 lastChecksum 一致
+  // (理解: bytesOnDisk 可能不按 chunk 对齐, 说明盘上最后有 partial chunk, 读的时候可能这个
+  //  partial chunk 刚好 append 了数据, 则盘上这个 chunk 的 checksum 也会被覆盖, 那么读的线程从盘上读出的 chunk data 和 checksum 就
+  //  会不一致, 因为只读出 partial chunk, 但 checksum 对应已经 append 了数据的 chunk.  所以读的时候取出一致的 bytesOnDisk 和
+  //  lastChecksum, 最后一个 chunk 的 checksum 直接用 lastChecksum, 就能保证跟实际读出的 partial chunk 对应)
+  // TODO 单独读 bytesOnDisk 时不会用 lock, 不需要考虑线程安全问题吗?
   private long bytesOnDisk;
   private byte[] lastChecksum;
+
   private AtomicReference<Thread> writer = new AtomicReference<Thread>();
 
   /**

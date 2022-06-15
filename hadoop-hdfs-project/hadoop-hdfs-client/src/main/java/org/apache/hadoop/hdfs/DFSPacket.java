@@ -47,7 +47,10 @@ public class DFSPacket {
   private boolean syncBlock; // this packet forces the current block to disk
   private int numChunks; // number of chunks currently in packet
   private final int maxChunks; // max chunks in packet
+
+  // 存放数据
   private byte[] buf;
+
   private final boolean lastPacketInBlock; // is this the last packet in block?
 
   /**
@@ -64,10 +67,15 @@ public class DFSPacket {
    * preceding the checksum data, so we make sure to keep enough space in
    * front of the checksum data to support the largest conceivable header.
    */
+  // buf中存放CHECKSUMS的起始位置, 即CHECKSUMS首个字节的offset
   private int checksumStart;
+  // buf中存放CHECKSUMS的游标, 初始化为checksumStart, 拷贝len数据后+len, 即CHECKSUMS尾后字节的offset
   private int checksumPos;
+  // buf中存放DATA的起始位置, 即DATA首个字节的offset
   private final int dataStart;
+  // buf中存放DATA的游标, 初始化为dataStart, 拷贝len数据后+len, 即DATA尾后字节的offset
   private int dataPos;
+
   private SpanId[] traceParents = EMPTY;
   private int traceParentsUsed;
   private TraceScope scope;
@@ -95,6 +103,7 @@ public class DFSPacket {
     checksumPos = checksumStart;
     dataStart = checksumStart + (chunksPerPkt * checksumSize);
     dataPos = dataStart;
+
     maxChunks = chunksPerPkt;
   }
 
@@ -179,6 +188,7 @@ public class DFSPacket {
     assert headerStart >= 0;
     assert headerStart + header.getSerializedSize() == checksumStart;
 
+    // 将 header 拷贝到 buf 中紧靠 checksum 区的前部, 也就是说并不一定是 buf 的开头处
     // Copy the header data into the buffer immediately preceding the checksum
     // data.
     System.arraycopy(header.getBytes(), 0, buf, headerStart,
@@ -215,6 +225,7 @@ public class DFSPacket {
     buf = null;
   }
 
+  // 感觉这里注释错了, 应该是packet最后一个字节之后一个字节在block中的offset, 即packet写入block后, block会有多少数据
   /**
    * get the packet's last byte's offset in the block
    *

@@ -1033,9 +1033,13 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
   public DFSInputStream open(String src, int buffersize, boolean verifyChecksum)
       throws IOException {
     checkOpen();
+
     //    Get block info from namenode
     try (TraceScope ignored = newPathTraceScope("newDFSInputStream", src)) {
+      // 基本就是调用了一下 NN 的 getBlockLocations 接口, 获取文件的信息 (包括长度, 最后一个 block), 获取指定范围内 block 的信息 (包括所在 DN 等)
+      // range 写死为从 0 开始的一段固定长度 (长度可配置)
       LocatedBlocks locatedBlocks = getLocatedBlocks(src, 0);
+
       return openInternal(locatedBlocks, src, verifyChecksum);
     }
   }
@@ -1068,11 +1072,13 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
   private DFSInputStream openInternal(LocatedBlocks locatedBlocks, String src,
       boolean verifyChecksum) throws IOException {
     if (locatedBlocks != null) {
+      // EC
       ErasureCodingPolicy ecPolicy = locatedBlocks.getErasureCodingPolicy();
       if (ecPolicy != null) {
         return new DFSStripedInputStream(this, src, verifyChecksum, ecPolicy,
             locatedBlocks);
       }
+
       return new DFSInputStream(this, src, verifyChecksum, locatedBlocks);
     } else {
       throw new IOException("Cannot open filename " + src);
@@ -1257,14 +1263,23 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
       ChecksumOpt checksumOpt, InetSocketAddress[] favoredNodes,
       String ecPolicyName, String storagePolicy)
       throws IOException {
+    // 检查DFSClient.clientRunning
     checkOpen();
+
     final FsPermission masked = applyUMask(permission);
+
     LOG.debug("{}: masked={}", src, masked);
+
+    // 构造一个DFSOutputStream
     final DFSOutputStream result = DFSOutputStream.newStreamForCreate(this,
         src, masked, flag, createParent, replication, blockSize, progress,
         dfsClientConf.createChecksum(checksumOpt),
         getFavoredNodesStr(favoredNodes), ecPolicyName, storagePolicy);
+
+    // 获取租约, 会将result加入DFSClient#filesBeingWritten
     beginFileLease(result.getFileId(), result);
+
+    // 返回DFSOutputStream
     return result;
   }
 
@@ -1458,6 +1473,7 @@ public class DFSClient implements java.io.Closeable, RemotePeerFactory,
     return createWrappedOutputStream(out, statistics, out.getInitialLen());
   }
 
+  // 其他两个 DFSClient#append(...) 调用这里
   private DFSOutputStream append(String src, int buffersize,
       EnumSet<CreateFlag> flag, String[] favoredNodes, Progressable progress)
       throws IOException {

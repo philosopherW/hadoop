@@ -645,9 +645,11 @@ public class FsVolumeImpl implements FsVolumeSpi {
     @JsonProperty
     private long iterStartMs;
 
+    // finalized 目录下的一级子目录
     @JsonProperty
     private String curFinalizedDir;
 
+    // finalized 目录下的二级子目录
     @JsonProperty
     private String curFinalizedSubDir;
 
@@ -941,7 +943,7 @@ public class FsVolumeImpl implements FsVolumeSpi {
    */
   File createRbwFile(String bpid, Block b) throws IOException {
     checkReference();
-    reserveSpaceForReplica(b.getNumBytes());
+    reserveSpaceForReplica(b.getNumBytes());  // TODO 干啥的
     try {
       return getBlockPoolSlice(bpid).createRbwFile(b);
     } catch (IOException exception) {

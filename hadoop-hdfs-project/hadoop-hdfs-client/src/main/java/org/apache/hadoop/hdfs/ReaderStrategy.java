@@ -115,8 +115,10 @@ class ByteArrayStrategy implements ReaderStrategy {
   @Override
   public int readFromBlock(BlockReader blockReader,
                            int length) throws IOException {
+    // blockReader读最多length数据到readBuf的offset处
     int nRead = blockReader.read(readBuf, offset, length);
     if (nRead > 0) {
+      // 更新client app的buf的offset
       offset += nRead;
     }
     return nRead;

@@ -216,6 +216,7 @@ public class PeerCache {
       Iterator<Entry<Key, Value>> iter =
           multimap.entries().iterator();
       Entry<Key, Value> entry = iter.next();
+      // 看这里的用法, multimap存储的顺序是按照put的顺序, 最早put的肯定是最先过期, 所以每次判断第一个元素, 如果这个元素都没过期, 后面的肯定也没过期 (?????)
       // if oldest socket expired, remove it
       if (entry == null ||
           Time.monotonicNow() - entry.getValue().getTime() < expiryPeriod) {

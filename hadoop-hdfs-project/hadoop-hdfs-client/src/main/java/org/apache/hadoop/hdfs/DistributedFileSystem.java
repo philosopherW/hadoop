@@ -326,12 +326,15 @@ public class DistributedFileSystem extends FileSystem
     }.resolve(this, absF);
   }
 
+  // 注意实际返回的是 HdfsDataInputStream
   @Override
   public FSDataInputStream open(Path f, final int bufferSize)
       throws IOException {
     statistics.incrementReadOps(1);
     storageStatistics.incrementOpCounter(OpType.OPEN);
+
     Path absF = fixRelativePart(f);
+
     return new FileSystemLinkResolver<FSDataInputStream>() {
       @Override
       public FSDataInputStream doCall(final Path p) throws IOException {
@@ -594,15 +597,22 @@ public class DistributedFileSystem extends FileSystem
       final InetSocketAddress[] favoredNodes, final String ecPolicyName,
       final String storagePolicy)
       throws IOException {
+    // 一些statistics
     statistics.incrementWriteOps(1);
     storageStatistics.incrementOpCounter(OpType.CREATE);
+
     Path absF = fixRelativePart(f);
+
+    // 可以简单的理解为, 调用resolve()会透传调用doCall()
     return new FileSystemLinkResolver<HdfsDataOutputStream>() {
       @Override
       public HdfsDataOutputStream doCall(final Path p) throws IOException {
+        // 构造一个DFSOutputStream
         final DFSOutputStream out = dfs.create(getPathName(f), permission,
             flag, true, replication, blockSize, progress, bufferSize,
             checksumOpt, favoredNodes, ecPolicyName, storagePolicy);
+
+        // 封装成HdfsDataOutputStream并返回
         return safelyCreateWrappedOutputStream(out);
       }
       @Override

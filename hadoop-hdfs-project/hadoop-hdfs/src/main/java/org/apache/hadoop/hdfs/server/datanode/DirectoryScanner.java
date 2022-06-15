@@ -460,6 +460,7 @@ public class DirectoryScanner implements Runnable {
 
     clear();
 
+    // 从盘上获取每个 volume 的 block 集合, 重组为每个 block pool 的 block 有序集合
     Collection<ScanInfoVolumeReport> volumeReports = getVolumeReports();
     for (ScanInfoVolumeReport volumeReport : volumeReports) {
       for (String blockPoolId : volumeReport.getBlockPoolIds()) {
@@ -479,6 +480,7 @@ public class DirectoryScanner implements Runnable {
       Collection<ScanInfo> diffRecord = new ArrayList<>();
 
       statsRecord.totalBlocks = blockpoolReport.size();
+      // 从 ReplicaMap 获取当前 block pool 的 finalized 有序集合
       final List<ReplicaInfo> bl;
       bl = dataset.getSortedFinalizedBlocks(bpid);
 

@@ -1438,7 +1438,8 @@ class FsDatasetImpl implements FsDatasetSpi<FsVolumeImpl> {
   public ReplicaHandler createRbw(
       StorageType storageType, String storageId, ExtendedBlock b,
       boolean allowLazyPersist) throws IOException {
-    try (AutoCloseableLock lock = datasetWriteLock.acquire()) {
+    try (AutoCloseableLock lock = datasetWriteLock.acquire()) {  // TODO 这个锁保护什么?  下一行的 volumeMap?
+      // 这里只是尝试 get 一下, 预期是 get 不到的
       ReplicaInfo replicaInfo = volumeMap.get(b.getBlockPoolId(),
           b.getBlockId());
       if (replicaInfo != null) {
@@ -1446,6 +1447,7 @@ class FsDatasetImpl implements FsDatasetSpi<FsVolumeImpl> {
             " already exists in state " + replicaInfo.getState() +
             " and thus cannot be created.");
       }
+
       // create a new block
       FsVolumeReference ref = null;
 
@@ -1472,6 +1474,7 @@ class FsDatasetImpl implements FsDatasetSpi<FsVolumeImpl> {
         }
       }
 
+      // 选盘
       if (ref == null) {
         ref = volumes.getNextVolume(storageType, storageId, b.getNumBytes());
       }

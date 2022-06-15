@@ -114,10 +114,15 @@ public class DFSInputStream extends FSInputStream
   // state by stateful read only:
   // (protected by lock on this)
   /////
+  // 当前正在从这个DN读数据
   private DatanodeInfo currentNode = null;
+  // 当前正在读的block的信息
   protected LocatedBlock currentLocatedBlock = null;
+  // 当前要读的file offset; 每次读数据后会更新
   protected long pos = 0;
+  // 当前正在读的block最后一个字节在file中的offset
   protected long blockEnd = -1;
+  // 用于读当前block的BlockReader
   private BlockReader blockReader = null;
   ////
 
@@ -125,6 +130,7 @@ public class DFSInputStream extends FSInputStream
   // (protected by lock on infoLock)
   ////
   protected LocatedBlocks locatedBlocks = null;
+  // 文件最后一个 block 如果不是 complete, 这里会记录其可见长度
   private long lastBlockBeingWrittenLength = 0;
   private FileEncryptionInfo fileEncryptionInfo = null;
   protected CachingStrategy cachingStrategy;
@@ -140,6 +146,7 @@ public class DFSInputStream extends FSInputStream
   private final long refreshReadBlockIntervals;
   /** timeStamp of the last time a block location was refreshed. */
   private long locatedBlocksTimeStamp;
+
   /**
    * Track the ByteBuffers that we have handed out to readers.
    *
@@ -205,6 +212,7 @@ public class DFSInputStream extends FSInputStream
 
   DFSInputStream(DFSClient dfsClient, String src, boolean verifyChecksum,
       LocatedBlocks locatedBlocks) throws IOException {
+    // 记录各种信息
     this.dfsClient = dfsClient;
     this.refreshReadBlockIntervals =
         this.dfsClient.getRefreshReadBlkLocationsInterval();
@@ -215,6 +223,10 @@ public class DFSInputStream extends FSInputStream
       this.cachingStrategy = dfsClient.getDefaultReadCachingStrategy();
     }
     this.locatedBlocks = locatedBlocks;
+
+    // 如果 file 最后一个 block 不是 complete, 从 DN 查其可见长度, 记录到
+    //  * DFSInputStream.lastBlockBeingWrittenLength
+    //  * DFSInputStream.locatedBlocks 的 lastLocatedBlock
     openInfo(false);
   }
 
@@ -241,6 +253,8 @@ public class DFSInputStream extends FSInputStream
     this.locatedBlocksTimeStamp = timeStamp;
   }
 
+  // 基本就是调用 fetchLocatedBlocksAndGetLastBlockLength
+  // 注意很多地方会调用这个 openInfo
   /**
    * Grab the open-file info from namenode
    * @param refreshLocatedBlocks whether to re-fetch locatedblocks
@@ -248,8 +262,13 @@ public class DFSInputStream extends FSInputStream
   void openInfo(boolean refreshLocatedBlocks) throws IOException {
     final DfsClientConf conf = dfsClient.getConf();
     synchronized(infoLock) {
+      // 如果是 open 流程, 即 DFSInputStream.DFSInputStream 中的调用, 不会刷新 DFSInputStream.locatedBlocks, 只会查 file 最后一
+      //  个未 complete 的 block 的可见长度
       lastBlockBeingWrittenLength =
           fetchLocatedBlocksAndGetLastBlockLength(refreshLocatedBlocks);
+
+      // 集群重启过程中, 可能需要重试
+      // TODO 这段写法有点诡异, 为什么不把 if (lastBlockBeingWrittenLength == -1) 放在外层?
       int retriesForLastBlockLength = conf.getRetryTimesForGetLastBlockLength();
       while (retriesForLastBlockLength > 0) {
         // Getting last block length as -1 is a special case. When cluster
@@ -261,6 +280,7 @@ public class DFSInputStream extends FSInputStream
               + "Datanodes might not have reported blocks completely."
               + " Will retry for " + retriesForLastBlockLength + " times");
           waitFor(conf.getRetryIntervalForGetLastBlockLength());
+          // 注意参数, 这里会强制刷新 DFSInputStream.locatedBlocks
           lastBlockBeingWrittenLength =
               fetchLocatedBlocksAndGetLastBlockLength(true);
         } else {
@@ -307,6 +327,7 @@ public class DFSInputStream extends FSInputStream
     return true;
   }
 
+  // 如果需要则刷新DFSInputStream#locatedBlocks (实际可能只是clear)
   /**
    * Update the block locations timestamps if they have expired.
    * In the case of expired timestamp:
@@ -322,15 +343,29 @@ public class DFSInputStream extends FSInputStream
     }
     // clear dead nodes
     deadNodes.clear();
+
+    // 理解: 注意写死了会读file开头的一部分block的信息然后覆盖到DFSInputStream#locatedBlocks, 如果之前读到了后面block的信息, 就会全部丢
+    // 掉, 在需要的时候会重新读, 相当于通过clear的方式触发整个file的DFSInputStream#locatedBlocks的刷新
     openInfo(true);
+
     setLocatedBlocksTimeStamp();
     return true;
   }
 
+  // 两件事
+  // * 可能更新 DFSInputStream.locatedBlocks
+  // * 如果 file 最后一个 block 不是 complete, 尝试从 DN 查找其可见长度, 并记录到 DFSInputStream.locatedBlocks 的 lastLocatedBlock, 并返回
   private long fetchLocatedBlocksAndGetLastBlockLength(boolean refresh)
       throws IOException {
+    // ================================================
+    // 如果 DFSInputStream.locatedBlocks 为空或通过参数强制 refresh, 会从 NN 查从0开始一段固定长度的 block 的信息覆盖到
+    //  DFSInputStream.locatedBlocks.  注意 DFSInputStream.locatedBlocks 原本可能已经有更大范围的 block 信息, 经此覆盖会消失, 意
+    //  图是在需要的时候重新去 NN 查以达到刷新的目的???  注意 file 最后一个 block 可能发生变化???  TODO 待确认
+    // open 过程中, 这段不做任何事
     LocatedBlocks newInfo = locatedBlocks;
     if (locatedBlocks == null || refresh) {
+      // 注意还是查 offset 从0开始的一段的信息
+      // TODO 从 pos 开始查会不会更合理一点?  大概率会从 pos 继续往后读?  还是为了下面的检查?
       newInfo = dfsClient.getLocatedBlocks(src, 0);
     }
     DFSClient.LOG.debug("newInfo = {}", newInfo);
@@ -338,6 +373,8 @@ public class DFSInputStream extends FSInputStream
       throw new IOException("Cannot open filename " + src);
     }
 
+    // newInfo 总是 offset 从0开始一段固定长度, DFSInputStream.locatedBlocks 也总会包括这个区间, 这里检查也只会检查这个区间
+    // TODO 这段检查的意义是什么?
     if (locatedBlocks != null) {
       Iterator<LocatedBlock> oldIter =
           locatedBlocks.getLocatedBlocks().iterator();
@@ -348,28 +385,47 @@ public class DFSInputStream extends FSInputStream
         }
       }
     }
+
+    // 覆盖
     locatedBlocks = newInfo;
+    // ================================================
+
     long lastBlkBeingWrittenLength = getLastBlockLength();
+
+    // TODO 这是啥? 为什么要更新这个?
     fileEncryptionInfo = locatedBlocks.getFileEncryptionInfo();
 
     return lastBlkBeingWrittenLength;
   }
 
+  // 如果 file 最后一个 block 不是 complete, 尝试从 DN 查找其可见长度并记录到 DFSInputStream.locatedBlocks 的 lastLocatedBlock
   private long getLastBlockLength() throws IOException{
     long lastBlockBeingWrittenLength = 0;
+
+    // 如果 file 最后一个 block 是 complete, 直接返回0, 这时 locatedBlocks.fileLength 已经是完整的 file 长度
+    // 否则要去 DN 查一次最后一个 block 的可见长度, locatedBlocks.fileLength + lastBlockBeingWrittenLength 才是完整的 file 长度
     if (!locatedBlocks.isLastBlockComplete()) {
       final LocatedBlock last = locatedBlocks.getLastLocatedBlock();
       if (last != null) {
+        // 如果 NN 没有返回 block 的位置信息
         if (last.getLocations().length == 0) {
           if (last.getBlockSize() == 0) {
+            // TODO 如果 NN 返回的 block 长度为0, 说明此时可能 block 刚新建, 还没来得及分配 DN?  是否可能是其他情况?
             // if the length is zero, then no data has been written to
             // datanode. So no need to wait for the locations.
             return 0;
           }
+          // TODO 如果 NN 返回的 block 长度非0, 说明但查不到所在 DN, 目前认为是重启过程中暂时查不到?
           return -1;
         }
+
+        // 如果 NN 有返回 block 的位置信息, 则去任意一个 DN 查 block 可见长度
         final long len = readBlockLength(last);
+
+        // 长度记录到 DFSInputStream.locatedBlocks 的 lastLocatedBlock
+        // TODO org.apache.hadoop.hdfs.DFSInputStream.locatedBlocks 的 blocks 可能也有最后一个未 complete 的 block 吗?  看下 NN 逻辑
         last.getBlock().setNumBytes(len);
+
         lastBlockBeingWrittenLength = len;
       }
     }
@@ -377,9 +433,11 @@ public class DFSInputStream extends FSInputStream
     return lastBlockBeingWrittenLength;
   }
 
+  // TODO 注意可能从任意一个 DN 查到可见长度, 但并没有记录是哪个 DN, 意味着可能查到可见长度的 DN 和真正读数据的 DN 不一致?  如何处理的?
   /** Read the block length from one of the datanodes. */
   private long readBlockLength(LocatedBlock locatedblock) throws IOException {
     assert locatedblock != null : "LocatedBlock cannot be null";
+
     int replicaNotFoundCount = locatedblock.getLocations().length;
 
     final DfsClientConf conf = dfsClient.getConf();
@@ -397,6 +455,7 @@ public class DFSInputStream extends FSInputStream
             dfsClient.getConfiguration(), timeout,
             conf.isConnectToDnViaHostname(), locatedblock);
 
+        // 调用 DN 的接口 getReplicaVisibleLength 查可见长度
         final long n = cdp.getReplicaVisibleLength(locatedblock.getBlock());
 
         if (n >= 0) {
@@ -501,6 +560,7 @@ public class DFSInputStream extends FSInputStream
     return getBlockRange(0, getFileLength());
   }
 
+  // 查指定offset的LocatedBlock
   /**
    * Get block at the specified position.
    * Fetch it from the namenode if not cached.
@@ -517,17 +577,22 @@ public class DFSInputStream extends FSInputStream
 
       //check offset
       if (offset < 0 || offset >= getFileLength()) {
+        // 如果范围超过file, 抛异常
         throw new IOException("offset < 0 || offset >= getFileLength(), offset="
             + offset
             + ", locatedBlocks=" + locatedBlocks);
       }
       else if (offset >= locatedBlocks.getFileLength()) {
+        // 如果是file的最后一个block, 直接查本地缓存专用字段, open的时候会把file最后一个block的信息读到这里, 之后也会定期刷新 (但如果不用
+        // 就不会触发刷新? 这里是否也应该检查一下本地缓存是否过期?)
+        // 理解: 为什么不用使用LocatedBlocks#blocks? 从DN查到的最后一个block的visible length似乎只会记录到LocatedBlocks#lastLocatedBlock
         // offset to the portion of the last block,
         // which is not known to the name-node yet;
         // getting the last block
         blk = locatedBlocks.getLastLocatedBlock();
       }
       else {
+        // 如果是file的非最后一个block
         // search cached blocks first
         blk = fetchBlockAt(offset, 0, true);
       }
@@ -540,16 +605,21 @@ public class DFSInputStream extends FSInputStream
     return fetchBlockAt(offset, 0, false); // don't use cache
   }
 
+  // 查指定file offset的block信息 (LocatedBlock, 包括location信息) (支持使用cache, 即DFSInputStream#locatedBlocks)
   /** Fetch a block from namenode and cache it */
   private LocatedBlock fetchBlockAt(long offset, long length, boolean useCache)
       throws IOException {
     synchronized(infoLock) {
       updateBlockLocationsStamp();
+
+      // 判断cache是否已有 (DFSInputStream#locatedBlocks)
       int targetBlockIdx = locatedBlocks.findBlock(offset);
       if (targetBlockIdx < 0) { // block is not cached
         targetBlockIdx = LocatedBlocks.getInsertIndex(targetBlockIdx);
         useCache = false;
       }
+
+      // 如果不用cache则从NN查并更新cache
       if (!useCache) { // fetch blocks
         final LocatedBlocks newBlocks = (length == 0)
             ? dfsClient.getLocatedBlocks(src, offset)
@@ -566,6 +636,7 @@ public class DFSInputStream extends FSInputStream
               newBlocks.getLocatedBlocks());
         }
       }
+
       return locatedBlocks.get(targetBlockIdx);
     }
   }
@@ -644,6 +715,8 @@ public class DFSInputStream extends FSInputStream
     if (target >= getFileLength()) {
       throw new IOException("Attempted to read past end of file");
     }
+
+    // 关闭之前的BlockReader
     // Will be getting a new BlockReader.
     closeCurrentBlockReaders();
 
@@ -651,19 +724,20 @@ public class DFSInputStream extends FSInputStream
     // Connect to best DataNode for desired Block, with potential offset
     //
     DatanodeInfo chosenNode;
+
     int refetchToken = 1; // only need to get a new access token once
     int refetchEncryptionKey = 1; // only need to get a new encryption key once
-
     boolean connectFailedOnce = false;
 
+    // 理解: 循环是为了出错重试
     while (true) {
       // Re-fetch the locatedBlocks from NN if the timestamp has expired.
       updateBlockLocationsStamp();
 
+      // 查指定offset (target) 的block信息 (LocatedBlock, 包含location信息等)
       //
       // Compute desired block
       //
-
       LocatedBlock targetBlock = getBlockAt(target);
 
       // update current position
@@ -672,24 +746,34 @@ public class DFSInputStream extends FSInputStream
             targetBlock.getBlockSize() - 1;
       this.currentLocatedBlock = targetBlock;
 
+      // offsetIntoBlock: 要读的file offset在block内部的offset
       long offsetIntoBlock = target - targetBlock.getStartOffset();
 
+      // 选择一个DN
       DNAddrPair retval = chooseDataNode(targetBlock, null);
       chosenNode = retval.info;
       InetSocketAddress targetAddr = retval.addr;
       StorageType storageType = retval.storageType;
+      // 可能会重新获取block信息
       // Latest block if refreshed by chooseDatanode()
       targetBlock = retval.block;
 
       try {
+        // 构造一个BlockReader.
+        // 注意length参数, 这里没有管client app这次调用read()实际要读多少数据, 而是请求读完整个block (向DN发送OpReadBlockProto时,
+        // len设置为这里给的length参数), 有read ahead效果.
         blockReader = getBlockReader(targetBlock, offsetIntoBlock,
             targetBlock.getBlockSize() - offsetIntoBlock, targetAddr,
             storageType, chosenNode);
+
         if(connectFailedOnce) {
           DFSClient.LOG.info("Successfully connected to " + targetAddr +
                              " for " + targetBlock.getBlock());
         }
+
+        // 返回实际连接的DN
         return chosenNode;
+
       } catch (IOException ex) {
         checkInterrupted(ex);
         if (ex instanceof InvalidEncryptionKeyException && refetchEncryptionKey > 0) {
@@ -739,18 +823,18 @@ public class DFSInputStream extends FSInputStream
         setInetSocketAddress(targetAddr).
         setRemotePeerFactory(dfsClient).
         setDatanodeInfo(datanode).
-        setStorageType(storageType).
+        setStorageType(storageType).  // 目前似乎短路读才需要
         setFileName(src).
         setBlock(blk).
         setBlockToken(accessToken).
-        setStartOffset(offsetInBlock).
+        setStartOffset(offsetInBlock).  // startOffset
         setVerifyChecksum(verifyChecksum).
         setClientName(dfsClient.clientName).
-        setLength(length).
+        setLength(length).  // length
         setCachingStrategy(curCachingStrategy).
         setAllowShortCircuitLocalReads(!shortCircuitForbidden).
         setClientCacheContext(dfsClient.getClientContext()).
-        setUserGroupInformation(dfsClient.ugi).
+        setUserGroupInformation(dfsClient.ugi).  // 目前似乎短路读才需要
         setConfiguration(dfsClient.getConfiguration()).
         build();
   }
@@ -842,6 +926,9 @@ public class DFSInputStream extends FSInputStream
         }
         ioe = e;
       }
+
+      // 重新调用DFSInputStream.blockSeekTo, 重新选择一个DN建立连接并从当前DFSInputStream.pos继续读, 重新构造一个
+      // DFSInputStream.blockReader
       boolean sourceFound;
       if (retryCurrentNode) {
         /* possibly retry the same node so that transient errors don't
@@ -854,57 +941,83 @@ public class DFSInputStream extends FSInputStream
         dfsClient.addNodeToDeadNodeDetector(this, currentNode);
         sourceFound = seekToNewSource(pos);
       }
+
+      // 如果重新连接DN失败则抛出异常, 目前看起来有两种, ChecksumException或IOException
       if (!sourceFound) {
         throw ioe;
       }
+
       retryCurrentNode = false;
     }
   }
 
   protected synchronized int readWithStrategy(ReaderStrategy strategy)
       throws IOException {
+    // 检查DFSClient#clientRunning
     dfsClient.checkOpen();
+    // 检查DFSInputStream#closed
     if (closed.get()) {
       throw new IOException("Stream closed");
     }
 
+    // len: client app本次调用DFSInputStream.read(byte[], int, int)要读的长度
     int len = strategy.getTargetLength();
+
     CorruptedBlocks corruptedBlocks = new CorruptedBlocks();
     failures = 0;
+
+    // 注意这里 file length 的计算方式, locatedBlocks.fileLength + lastBlockBeingWrittenLength, 前者不包含UC的block的长度?
     if (pos < getFileLength()) {
       int retries = 2;
       while (retries > 0) {
         try {
+          // 这次从pos开始读, 确保当前blockReader可以读这个pos对应的block
           // currentNode can be left as null if previous read had a checksum
           // error on the same block. See HDFS-3067
           // currentNode needs to be updated if the blockLocations timestamp has
           // expired.
           if (pos > blockEnd || currentNode == null
               || updateBlockLocationsStamp()) {
+            // 如果当前blockReader不可用, 则新建BlockReader
             currentNode = blockSeekTo(pos);
           }
+
+          // 确定这次读的长度: 不超过client app要读的长度, 不超过当前block, 不超过file长度
           int realLen = (int) Math.min(len, (blockEnd - pos + 1L));
           synchronized(infoLock) {
+            // 执行以下判断的原因参考
+            // https://issues.apache.org/jira/browse/HDFS-7263
+            // https://issues.apache.org/jira/browse/HDFS-5343
+            // 理解: client app现在读的是一个snapshot, 不希望读到打snapshot之后append的数据, NN对snapshot返回的file长度是snapshot
+            // 的, 但最后一个block的长度可能是append之后的.  TODO 待进一步确认
             if (locatedBlocks.isLastBlockComplete()) {
               realLen = (int) Math.min(realLen,
                   locatedBlocks.getFileLength() - pos);
             }
           }
+
+          // 用blockReader尝试读realLen长度的数据到strategy (实际最多读出一个packet的数据)
           int result = readBuffer(strategy, realLen, corruptedBlocks);
 
           if (result >= 0) {
+            // 成功, 更新pos
             pos += result;
           } else {
             // got a EOS from reader though we expect more data on it.
             throw new IOException("Unexpected EOS from the reader");
           }
+
+          // statistics
           updateReadStatistics(readStatistics, result, blockReader);
           dfsClient.updateFileSystemReadStats(blockReader.getNetworkDistance(),
               result);
           if (readStatistics.getBlockType() == BlockType.STRIPED) {
             dfsClient.updateFileSystemECReadStats(result);
           }
+
+          // 返回实际读出的数据量
           return result;
+
         } catch (ChecksumException ce) {
           throw ce;
         } catch (IOException e) {
@@ -928,6 +1041,8 @@ public class DFSInputStream extends FSInputStream
         }
       }
     }
+
+    // 如果要读的pos超过file长度, 返回-1
     return -1;
   }
 
@@ -948,12 +1063,17 @@ public class DFSInputStream extends FSInputStream
   @Override
   public synchronized int read(@Nonnull final byte buf[], int off, int len)
       throws IOException {
+    // 检查参数
     validatePositionedReadArgs(pos, buf, off, len);
     if (len == 0) {
       return 0;
     }
+
+    // 要读到client app的byte array, 这里构造一个ByteArrayStrategy(readBuf = buf, offset = off, targetLength = len), 封装这个byte array
     ReaderStrategy byteArrayReader =
         new ByteArrayStrategy(buf, off, len, readStatistics, dfsClient);
+
+    // 读数据到刚创建的ByteArrayStrategy (内部使用BlockReader)
     return readWithStrategy(byteArrayReader);
   }
 

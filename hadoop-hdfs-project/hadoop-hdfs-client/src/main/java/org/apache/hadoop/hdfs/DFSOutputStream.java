@@ -121,7 +121,10 @@ public class DFSOutputStream extends FSOutputSummer
   protected long lastFlushOffset = 0; // offset when flush was invoked
   protected long initialFileSize = 0; // at time of file open
   private final short blockReplication; // replication factor of file
+
+  // 是否为 true 取决于 create() 或
   protected boolean shouldSyncBlock = false; // force blocks to disk upon close
+
   private final EnumSet<AddBlockFlag> addBlockFlags;
   protected final AtomicReference<CachingStrategy> cachingStrategy;
   private FileEncryptionInfo fileEncryptionInfo;
@@ -268,8 +271,8 @@ public class DFSOutputStream extends FSOutputSummer
       throws IOException {
     try (TraceScope ignored =
              dfsClient.newPathTraceScope("newStreamForCreate", src)) {
+      // 在NN创建文件, 获取HdfsFileStatus
       HdfsFileStatus stat = null;
-
       // Retry the create if we get a RetryStartFileException up to a maximum
       // number of times
       boolean shouldRetry = true;
@@ -310,6 +313,8 @@ public class DFSOutputStream extends FSOutputSummer
         }
       }
       Preconditions.checkNotNull(stat, "HdfsFileStatus should not be null!");
+
+      // 构造DFSOutputStream (传入刚创建文件获取的HdfsFileStatus) (包括构造DFSOutputStream.streamer)
       final DFSOutputStream out;
       if(stat.getErasureCodingPolicy() != null) {
         out = new DFSStripedOutputStream(dfsClient, src, stat,
@@ -318,7 +323,11 @@ public class DFSOutputStream extends FSOutputSummer
         out = new DFSOutputStream(dfsClient, src, stat,
             flag, progress, checksum, favoredNodes, true);
       }
+
+      // 启动DFSOutputStream.streamer线程
       out.start();
+
+      // 返回DFSOutputStream
       return out;
     }
   }
@@ -367,6 +376,7 @@ public class DFSOutputStream extends FSOutputSummer
     // if there is space in the last block, then we have to
     // append to that block
     if (freeInLastBlock == blockSize) {
+      // TODO 这是 full 吗?  这不是 empty 吗?
       throw new IOException("The last block for file " +
           src + " is full.");
     }
@@ -423,17 +433,23 @@ public class DFSOutputStream extends FSOutputSummer
     return dfsClient.newPathTraceScope("DFSOutputStream#write", src);
   }
 
+  // 写一个chunk及其checksum
   // @see FSOutputSummer#writeChunk()
   @Override
   protected synchronized void writeChunk(byte[] b, int offset, int len,
       byte[] checksum, int ckoff, int cklen) throws IOException {
+    // 做一些检查, 如果currentPacket == null则新建
     writeChunkPrepare(len, ckoff, cklen);
 
+    // 将chunk及其checksum写入currentPacket
     currentPacket.writeChecksum(checksum, ckoff, cklen);
     currentPacket.writeData(b, offset, len);
     currentPacket.incNumChunks();
+    // streamer的bytesCurBlock += len
     getStreamer().incBytesCurBlock(len);
 
+    // 如果currentPacket写满了或当前block写满了, 则将currentPacket加入DataStreamer#dataQueue
+    // 如果当前block写满了, 还会额外将一个空packet加入DataStreamer#dataQueue
     // If packet is full, enqueue it for transmission
     if (currentPacket.getNumChunks() == currentPacket.getMaxChunks() ||
         getStreamer().getBytesCurBlock() == blockSize) {
@@ -563,6 +579,10 @@ public class DFSOutputStream extends FSOutputSummer
     return StoreImplementationUtils.isProbeForSyncable(capability);
   }
 
+  // 注意: 只保证数据写到 DN, 但不保证 DN 写到操作系统, 更不保证持久化
+  // 注意: 同步接口
+  // 注意: flush 成功后数据可见
+  // 注意: flush 成功后数据对 new reader 可见.  应该是说 flush 之前 open 的 reader 不可见, 因为现在实现上是 open 时决定可以读到哪里, 之后不会再尝试更新可读范围
   /**
    * Flushes out to all replicas of the block. The data is in the buffers
    * of the DNs but not necessarily in the DN's OS buffers.
@@ -628,14 +648,19 @@ public class DFSOutputStream extends FSOutputSummer
       boolean updateLength = syncFlags.contains(SyncFlag.UPDATE_LENGTH);
       boolean endBlock = syncFlags.contains(SyncFlag.END_BLOCK);
       synchronized (this) {
+        // 把 checksum buffer 中的数据 flush 到 currentPacket
+        // 如果 checksum buffer 最后有 partial chunk, 会加入 currentPacket, 也会留在 checksum buffer, 返回已加入 currentPacket 但仍留在 checksum buffer 的数据的长度
         // flush checksum buffer, but keep checksum buffer intact if we do not
         // need to end the current block
         int numKept = flushBuffer(!endBlock, true);
+        // 如果 checksum buffer 原本确实有数据并加入 currentPacket 了, 那么 org.apache.hadoop.hdfs.DataStreamer.bytesCurBlock 会增加, 不过注意这个数值后面可能会回退一小段
         // bytesCurBlock potentially incremented if there was buffered data
 
         DFSClient.LOG.debug("DFSClient flush():  bytesCurBlock={}, "
                 + "lastFlushOffset={}, createNewBlock={}",
             getStreamer().getBytesCurBlock(), lastFlushOffset, endBlock);
+
+        // org.apache.hadoop.hdfs.DFSOutputStream.lastFlushOffset 记录上次 flush 的位置 (TODO 注意这里更新的时候 flush 还没有成功, 如果失败会怎样?)
         // Flush only if we haven't already flushed till this offset.
         if (lastFlushOffset != getStreamer().getBytesCurBlock()) {
           assert getStreamer().getBytesCurBlock() > lastFlushOffset;
@@ -660,15 +685,19 @@ public class DFSOutputStream extends FSOutputSummer
                 getStreamer().getBytesCurBlock(), getStreamer()
                     .getAndIncCurrentSeqno(), false);
           } else if (currentPacket != null) {
+            // lastFlushOffset 等于 org.apache.hadoop.hdfs.DataStreamer.bytesCurBlock 但 currentPacket 非空, 连续调用两次 flush 会出现这种情况.  不确定其他场景是否也会有这种情况.
             // just discard the current packet since it is already been sent.
             currentPacket.releaseBuffer(byteArrayManager);
             currentPacket = null;
           }
         }
+
+        // 把 currentPacket flush 到 DataStreamer
         if (currentPacket != null) {
           currentPacket.setSyncBlock(isSync);
           enqueueCurrentPacket();
         }
+
         if (endBlock && getStreamer().getBytesCurBlock() > 0) {
           // Need to end the current block, thus send an empty packet to
           // indicate this is the end of the block and reset bytesCurBlock
@@ -679,6 +708,8 @@ public class DFSOutputStream extends FSOutputSummer
           getStreamer().setBytesCurBlock(0);
           lastFlushOffset = 0;
         } else {
+          // 这里将 org.apache.hadoop.hdfs.DataStreamer.bytesCurBlock 设置为 flush 下去的数据减去最后一个 partial chunk.  即这
+          //  个 partial chunk 实际被 flush 到 DN 了, 但 DataStreamer 记录为未 flush, 且 checksum buffer 中也还有这部分数据
           // Restore state of stream. Record the last flush offset
           // of the last full chunk that was flushed.
           getStreamer().setBytesCurBlock(
@@ -688,13 +719,17 @@ public class DFSOutputStream extends FSOutputSummer
         toWaitFor = getStreamer().getLastQueuedSeqno();
       } // end synchronized
 
+      // 等待 DataStreamer 将所有已经 enqueue 的 packet 发送成功
       getStreamer().waitForAckedSeqno(toWaitFor);
 
+      // 每个 block 最多执行一次下面的逻辑, org.apache.hadoop.hdfs.DataStreamer.persistBlocks 在建立 block pipeline 时设置为 true, 并在执行下面逻辑时设置为 false
+      // @mocun: 如果不这样做, NN 重启后这个 block 可能丢失 (比如 NN 重启后, 有其他 client 将文件关闭)
       // update the block length first time irrespective of flag
       if (updateLength || getStreamer().getPersistBlocks().get()) {
         synchronized (this) {
           if (!getStreamer().streamerClosed()
               && getStreamer().getBlock() != null) {
+            // TODO 这个值具体是多少?
             lastBlockLength = getStreamer().getBlock().getNumBytes();
           }
         }
@@ -719,6 +754,7 @@ public class DFSOutputStream extends FSOutputSummer
         }
       }
 
+      // TODO 设置 org.apache.hadoop.hdfs.DataStreamer.isHflushed 的用处是什么? 目前似乎只有出错替换 DN 时有用到
       synchronized(this) {
         if (!getStreamer().streamerClosed()) {
           getStreamer().setHflush();

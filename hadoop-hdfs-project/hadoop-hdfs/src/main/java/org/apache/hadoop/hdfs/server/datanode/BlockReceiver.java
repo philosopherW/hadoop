@@ -437,6 +437,7 @@ class BlockReceiver implements Closeable {
       ((LocalReplica) replicaInfo).fsyncDirectory();
       dirSyncOnHSyncDone = true;
     }
+
     if (checksumOut != null || streams.getDataOut() != null) {
       datanode.metrics.addFlushNanos(flushTotalNanos);
       if (isSync) {
@@ -527,6 +528,7 @@ class BlockReceiver implements Closeable {
     return (mirrorOut == null || isDatanode || needsChecksumTranslation);
   }
 
+  // 注意!!! 每接收一个 packet 前, 都会至少先把前一个 packet flush 到操作系统
   /** 
    * Receives and processes a packet. It can contain many chunks.
    * returns the number of data bytes that the packet has.
@@ -570,11 +572,15 @@ class BlockReceiver implements Closeable {
 
     // update received bytes
     final long firstByteInBlock = offsetInBlock;
+    // 注意这时开始 offsetInBlock 表示当前 packet 尾后字节在 block 中的 offset TODO 为什么非要复用这个变量名, 很有歧义!!!
     offsetInBlock += len;
     if (replicaInfo.getNumBytes() < offsetInBlock) {
       replicaInfo.setNumBytes(offsetInBlock);
     }
-    
+
+    // enqueue 到 PacketResponder
+    // TODO 理解: client 写的场景, pipeline 的中间 DN 一般会走这个逻辑?  最后一个 DN 不会走这个逻辑?
+    // 注意 ackStatus 直接设置为成功
     // put in queue for pending acks, unless sync was requested
     if (responder != null && !syncBlock && !shouldVerifyChecksum()) {
       ((PacketResponder) responder.getRunnable()).enqueue(seqno,
@@ -593,8 +599,10 @@ class BlockReceiver implements Closeable {
         long begin = Time.monotonicNow();
         // For testing. Normally no-op.
         DataNodeFaultInjector.get().stopSendingPacketDownstream(mirrorAddr);
+
         packetReceiver.mirrorPacketTo(mirrorOut);
         mirrorOut.flush();
+
         long now = Time.monotonicNow();
         this.lastSentTime.set(now);
         long duration = now - begin;
@@ -680,18 +688,29 @@ class BlockReceiver implements Closeable {
           // resend part of data that is already on disk. Correct number of
           // bytes should be skipped when writing the data and checksum
           // buffers out to disk.
+          // 盘上最后一个 chunk 如果是 partial chunk, partialChunkSizeOnDisk 为其长度, 否则为 0
           long partialChunkSizeOnDisk = onDiskLen % bytesPerChecksum;
+          // 盘上最后一个非 partial 的 chunk 的右边界
           long lastChunkBoundary = onDiskLen - partialChunkSizeOnDisk;
+          // 盘上最后一个 chunk 是否对齐 (完整)
           boolean alignedOnDisk = partialChunkSizeOnDisk == 0;
+          // 这次收到的 packet 中数据的起始位置是否按 chunk 对齐 (firstByteInBlock 是 packet 首个字节在 block 中的 offset)
           boolean alignedInPacket = firstByteInBlock % bytesPerChecksum == 0;
 
           // If the end of the on-disk data is not chunk-aligned, the last
           // checksum needs to be overwritten.
+          // checksum 文件中记录的最后一个 chunk 的 checksum 是否要覆盖: 如果盘上最后一个 chunk 不对齐, 且要记录 checksum, 那么
+          //  checksum 文件中记录的最后一个 chunk 的 checksum 就要覆盖
           boolean overwriteLastCrc = !alignedOnDisk && !shouldNotWriteChecksum;
           // If the starting offset of the packat data is at the last chunk
           // boundary of the data on disk, the partial checksum recalculation
           // can be skipped and the checksum supplied by the client can be used
           // instead. This reduces disk reads and cpu load.
+          // 是否要计算盘上最后一个 chunk 的 checksum: 在盘上结尾有 partial chunk 的情况下, 如果 packet 起始位置是对齐的, 说明 packet
+          //  首个 chunk 包含了盘上的 partial chunk, 可以直接用 packet 中携带的 client 计算的 chunk 的 checksum, 而不需要自行计算
+          //  (理解: flush partial chunk 的场景, client 会保留 partial chunk, 下一个 packet 起始位置就是对齐的;  open for append
+          //   场景, client 没有原文件最后一个 partial chunk 的数据, 首个 packet 只有一个 partial chunk, 就需要 DN 自行计算这个
+          //   chunk append 数据后的 checksum)
           boolean doCrcRecalc = overwriteLastCrc &&
               (lastChunkBoundary != firstByteInBlock);
 
@@ -699,6 +718,7 @@ class BlockReceiver implements Closeable {
           // chunk in the packet. If the starting offset is not chunk
           // aligned, the packet should terminate at or before the next
           // chunk boundary.
+          // 如果 packet 起始位置不对齐, 那么 client 应保证 packet 只有这一个 chunk
           if (!alignedInPacket && len > bytesPerChecksum) {
             throw new IOException("Unexpected packet data length for "
                 +  block + " from " + inAddr + ": a partial chunk must be "
@@ -711,6 +731,7 @@ class BlockReceiver implements Closeable {
           // the checksum so that the checksum calculation can continue
           // from the right state. If the client provided the checksum for
           // the whole chunk, this is not necessary.
+          // 如果需要 DN 自行计算交接处 chunk 的新 checksum, 就先把原 checksum 读出来
           Checksum partialCrc = null;
           if (doCrcRecalc) {
             if (LOG.isDebugEnabled()) {
@@ -723,13 +744,17 @@ class BlockReceiver implements Closeable {
             partialCrc = computePartialChunkCrc(onDiskLen, offsetInChecksum);
           }
 
+          // ======== data 写 stream ========
+
           // The data buffer position where write will begin. If the packet
           // data and on-disk data have no overlap, this will not be at the
           // beginning of the buffer.
+          // dataBuf 中实际要往盘上写的数据的 offset, 如果 packet 数据跟盘上数据有重叠, 重叠的部分不会写盘 (理解: 写本地文件是 append)
           int startByteToDisk = (int)(onDiskLen-firstByteInBlock) 
               + dataBuf.arrayOffset() + dataBuf.position();
 
           // Actual number of data bytes to write.
+          // dataBuf 中实际要往盘上写的数据的 length
           int numBytesToDisk = (int)(offsetInBlock-onDiskLen);
           
           // Write data to disk.
@@ -747,6 +772,8 @@ class BlockReceiver implements Closeable {
           if (duration > maxWriteToDiskMs) {
             maxWriteToDiskMs = duration;
           }
+
+          // ======== checksum 写 stream ========
 
           final byte[] lastCrc;
           if (shouldNotWriteChecksum) {
@@ -814,8 +841,10 @@ class BlockReceiver implements Closeable {
           }
 
           /// flush entire packet, sync if requested
+          // stream flush 到操作系统, 如果需要则 sync 到盘
           flushOrSync(syncBlock);
-          
+
+          // 写操作系统后 (注意不一定 sync) 更新 replica info 的 bytesOnDisk 和 lastChecksum (更新时对 replica info 加锁)
           replicaInfo.setLastChecksumAndDataLen(offsetInBlock, lastCrc);
 
           datanode.metrics.incrBytesWritten(len);
@@ -971,11 +1000,13 @@ class BlockReceiver implements Closeable {
 
     try {
       if (isClient && !isTransfer) {
+        // 起一个 PacketResponder 线程
         responder = new Daemon(datanode.threadGroup, 
             new PacketResponder(replyOut, mirrIn, downstreams));
         responder.start(); // start thread to processes responses
       }
 
+      // 持续从上游接收 packet
       while (receivePacket() >= 0) { /* Receive until the last packet */ }
 
       // wait for all outstanding packet responses. And then
@@ -1371,6 +1402,7 @@ class BlockReceiver implements Closeable {
       datanode.metrics.incrDataNodePacketResponderCount();
       boolean lastPacketInBlock = false;
       final long startTime = ClientTraceLog.isInfoEnabled() ? System.nanoTime() : 0;
+      // 不停循环
       while (isRunning() && !lastPacketInBlock) {
         long totalAckTimeNanos = 0;
         boolean isInterrupted = false;
@@ -1383,12 +1415,16 @@ class BlockReceiver implements Closeable {
           try {
             if (type != PacketResponderType.LAST_IN_PIPELINE && !mirrorError) {
               DataNodeFaultInjector.get().failPipeline(replicaInfo, mirrorAddr);
+
+              // 从下游接收一个 ack
               // read an ack from downstream datanode
               ack.readFields(downstreamIn);
+
               ackRecvNanoTime = System.nanoTime();
               if (LOG.isDebugEnabled()) {
                 LOG.debug(myString + " got " + ack);
               }
+
               // Process an OOB ACK.
               Status oobStatus = ack.getOOBStatus();
               if (oobStatus != null) {
@@ -1398,20 +1434,30 @@ class BlockReceiver implements Closeable {
                       Status.SUCCESS));
                 continue;
               }
+
+              // ack 的 seqno
               seqno = ack.getSeqno();
             }
+
             if (seqno != PipelineAck.UNKOWN_SEQNO
                 || type == PacketResponderType.LAST_IN_PIPELINE) {
+              // 等 PacketResponder.ackQueue 非空后取首个 packet
               pkt = waitForAckHead(seqno);
+
               if (!isRunning()) {
                 break;
               }
+
+              // 期望从下游收到的 ack 的 seqno
               expected = pkt.seqno;
+
+              // 确认收到的 ack 是期望收到的 ack
               if (type == PacketResponderType.HAS_DOWNSTREAM_IN_PIPELINE
                   && seqno != expected) {
                 throw new IOException(myString + "seqno: expected=" + expected
                     + ", received=" + seqno);
               }
+
               if (type == PacketResponderType.HAS_DOWNSTREAM_IN_PIPELINE) {
                 // The total ack time includes the ack times of downstream
                 // nodes.
@@ -1482,8 +1528,9 @@ class BlockReceiver implements Closeable {
 
           Status myStatus = pkt != null ? pkt.ackStatus : Status.SUCCESS;
           sendAckUpstream(ack, expected, totalAckTimeNanos,
-            (pkt != null ? pkt.offsetInBlock : 0),
+            (pkt != null ? pkt.offsetInBlock : 0),  // 注意这里的 offsetInBlock 是 packet 尾后字节在 block 中的 offset
             PipelineAck.combineHeader(datanode.getECN(), myStatus));
+
           if (pkt != null) {
             // remove the packet from the ack queue
             removeAckHead();
@@ -1560,6 +1607,7 @@ class BlockReceiver implements Closeable {
         long totalAckTimeNanos, long offsetInBlock,
         int myHeader) throws IOException {
       try {
+        // TODO 啥意思, 什么是 other sender?  看起来是跟 OOB 有关, 但是没看出来哪里会有并发
         // Wait for other sender to finish. Unless there is an OOB being sent,
         // the responder won't have to wait.
         synchronized(this) {
@@ -1607,6 +1655,7 @@ class BlockReceiver implements Closeable {
         int h1 = PipelineAck.combineHeader(datanode.getECN(), Status.ERROR);
         replies = new int[] {h, h1};
       } else {
+        // 将本机的响应和下游的响应拼起来
         short ackLen = type == PacketResponderType.LAST_IN_PIPELINE ? 0 : ack
             .getNumOfReplies();
         replies = new int[ackLen + 1];
@@ -1614,6 +1663,7 @@ class BlockReceiver implements Closeable {
         for (int i = 0; i < ackLen; ++i) {
           replies[i + 1] = ack.getHeaderFlag(i);
         }
+
         // If the mirror has reported that it received a corrupt packet,
         // do self-destruct to mark myself bad, instead of making the
         // mirror node bad. The mirror is guaranteed to be good without
@@ -1625,18 +1675,24 @@ class BlockReceiver implements Closeable {
               + "thread is corrupt");
         }
       }
+
       PipelineAck replyAck = new PipelineAck(seqno, replies,
           totalAckTimeNanos);
+
       if (replyAck.isSuccess()
           && offsetInBlock > replicaInfo.getBytesAcked()) {
+        // 收到 ack 的数据量记录到 org.apache.hadoop.hdfs.server.datanode.LocalReplicaInPipeline.bytesAcked
         replicaInfo.setBytesAcked(offsetInBlock);
       }
+
       // send my ack back to upstream datanode
       long begin = Time.monotonicNow();
       /* for test only, no-op in production system */
       DataNodeFaultInjector.get().delaySendingAckToUpstream(inAddr);
+
       replyAck.write(upstreamOut);
       upstreamOut.flush();
+
       long duration = Time.monotonicNow() - begin;
       DataNodeFaultInjector.get().logDelaySendingAckToUpstream(
           inAddr,
